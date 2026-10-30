@@ -16,10 +16,34 @@ void main() {
     for (var i = 0; i < 4; i++) {
       governor.observeModel(500, 5000 + i * 600);
     }
-    expect(governor.budget.detectionEnabled, isFalse);
+    expect(governor.budget.tier, AnalysisTier.lowFrequency);
+    expect(governor.budget.detectionEnabled, isTrue);
     expect(governor.budget.framingEnabled, isFalse);
     expect(governor.budget.fps, 1);
+    for (var i = 0; i < 12; i++) {
+      governor.observeModel(900, 8000 + i * 1000);
+    }
+    expect(governor.budget.detectionEnabled, isTrue);
   });
+  test(
+    'real thermal or memory pressure still pauses detection after slow-device degradation',
+    () {
+      for (final thermal in [true, false]) {
+        final governor = PerformanceGovernor();
+        for (var i = 0; i < 4; i++) {
+          governor.observeModel(700, i * 1000);
+        }
+        expect(governor.budget.detectionEnabled, isTrue);
+        if (thermal) {
+          governor.observeDevice({'thermalLevel': 2}, 5000);
+        } else {
+          governor.memoryPressure(5000);
+        }
+        expect(governor.budget.tier, AnalysisTier.minimal);
+        expect(governor.budget.detectionEnabled, isFalse);
+      }
+    },
+  );
   test('device pressure lowers work without oscillating on recovery', () {
     final governor = PerformanceGovernor();
     governor.observeDevice({'lowRam': true}, 0);

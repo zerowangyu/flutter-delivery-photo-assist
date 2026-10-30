@@ -46,6 +46,7 @@ android {
 
     defaultConfig {
         minSdk = 24
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     testOptions {
@@ -76,4 +77,5 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("org.mockito:mockito-core:5.0.0")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
 }

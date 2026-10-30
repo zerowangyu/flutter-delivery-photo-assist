@@ -17,8 +17,18 @@ class CameraAnalysisConfig {
 
 /// 相机与识别独立：相机成功打开后，即使模型失败也可拍照。
 class DeliveryCameraController {
+  DeliveryCameraController({
+    PicoDetDetector Function(PicoDetModel)? detectorFactory,
+  }) : _detectorFactory = detectorFactory ?? PicoDetDetector.new;
+
+  final PicoDetDetector Function(PicoDetModel) _detectorFactory;
   CameraController? _camera;
   PicoDetDetector? _detector;
+  PicoDetModel? _model;
+  Future<void> _initialization = Future<void>.value();
+  Future<void> _previewOperations = Future<void>.value();
+  int _initializationEpoch = 0;
+  bool _wantsActive = true, _streamReady = false, _zoomAvailable = false;
   final changes = ValueNotifier<int>(0);
   final _zoomEvents = StreamController<double>.broadcast();
   Stream<double> get zoomEvents => _zoomEvents.stream;
@@ -43,31 +53,54 @@ class DeliveryCameraController {
   bool get isInitialized =>
       !_disposed && (_camera?.value.isInitialized ?? false);
   CameraController? get camera => _camera;
+  bool get modelReady => !_disposed && _detector != null;
+
+  bool _current(int epoch, [CameraController? camera]) =>
+      !_disposed &&
+      epoch == _initializationEpoch &&
+      (camera == null || identical(camera, _camera));
 
   Future<void> initialize(
     PicoDetModel model, {
     required void Function(Map<String, dynamic>) onFrame,
     required void Function(String) onError,
     required VoidCallback onReady,
-  }) async {
+  }) {
+    if (_disposed) return Future<void>.value();
+    final epoch = ++_initializationEpoch;
+    _model = model;
     _onFrame = onFrame;
     _onError = onError;
     _onReady = onReady;
     _active = false;
     _generation++;
+    // 重开请求串行清理资源；迟到的旧初始化不能覆盖新相机或模型。
+    return _initialization = _initialization.then(
+      (_) => _initialize(model, epoch),
+    );
+  }
+
+  Future<void> _initialize(PicoDetModel model, int epoch) async {
+    if (!_current(epoch)) return;
+    await _previewOperations;
     final previous = _camera;
     _camera = null;
-    await previous?.dispose();
+    final previousDetector = _detector;
+    _detector = null;
+    _streamReady = false;
+    _zoomAvailable = false;
+    await _optional(() async => previous?.dispose());
     while (_busy) {
       await Future<void>.delayed(const Duration(milliseconds: 20));
     }
-    await _detector?.close();
-    _detector = null;
+    await _optional(() async => previousDetector?.close());
+    if (!_current(epoch)) return;
     cameraError = null;
     modelError = null;
     objects = [];
     _jpeg = null;
-    if (_disposed) return;
+    _text = {};
+    isTorchEnabled = false;
     try {
       final cameras = await availableCameras();
       final back = cameras
@@ -78,7 +111,7 @@ class DeliveryCameraController {
         (c) => c.lensType == CameraLensType.wide,
         orElse: () => back.first,
       );
-      if (_disposed) return;
+      if (!_current(epoch)) return;
       final next = CameraController(
         description,
         ResolutionPreset.high,
@@ -88,41 +121,116 @@ class DeliveryCameraController {
             : ImageFormatGroup.yuv420,
       );
       _camera = next;
+      next.addListener(() {
+        if (_current(epoch, next) &&
+            next.value.hasError &&
+            cameraError != next.value.errorDescription) {
+          cameraError = next.value.errorDescription;
+          _active = false;
+          _onError?.call('相机暂不可用，请重新打开');
+          _notify();
+        }
+      });
       await next.initialize();
-      if (_disposed) {
-        await next.dispose();
-        return;
+      if (!_current(epoch, next)) return;
+      // 缩放、方向锁定和补光并非所有设备都支持，失败不应关闭快门或识别。
+      await _optional(
+        () => next.lockCaptureOrientation(DeviceOrientation.portraitUp),
+      );
+      _minimum = _maximum = _zoom = 1;
+      try {
+        final low = await next.getMinZoomLevel();
+        final high = math.min(8.0, await next.getMaxZoomLevel());
+        if (!low.isFinite || !high.isFinite || low <= 0 || high < low) {
+          throw StateError('无效的缩放范围');
+        }
+        final zoom = 1.0.clamp(low, high);
+        await next.setZoomLevel(zoom);
+        if (!_current(epoch, next)) return;
+        _minimum = low;
+        _maximum = high;
+        _zoom = zoom;
+        _zoomAvailable = high > low;
+      } catch (_) {
+        _zoomAvailable = false;
       }
-      await next.lockCaptureOrientation(DeviceOrientation.portraitUp);
-      _minimum = await next.getMinZoomLevel();
-      _maximum = math.min(8, await next.getMaxZoomLevel());
-      _zoom = 1.0.clamp(_minimum, _maximum);
-      await next.setZoomLevel(_zoom);
-      await next.setFlashMode(FlashMode.off);
-      _active = true;
+      if (!_current(epoch, next)) return;
+      await _optional(() => next.setFlashMode(FlashMode.off));
+      await _syncPreview(next, model, epoch);
+      if (!_current(epoch, next)) return;
       _notify();
       _onReady?.call();
       // 模型加载不会推迟相机预览或快门可用时机。
-      final detector = PicoDetDetector(model);
+      final detector = _detectorFactory(model);
       try {
         await detector.open();
-        if (_disposed) {
+        if (!_current(epoch, next)) {
           await detector.close();
           return;
         }
         _detector = detector;
       } catch (error) {
+        await _optional(detector.close);
+        if (!_current(epoch, next)) return;
         modelError = error.toString();
         _onError?.call('识别暂不可用，仍可拍照');
       }
-      if (!_disposed && _active)
-        await next.startImageStream((image) => _accept(image, model));
+      if (!_current(epoch, next)) return;
+      _streamReady = true;
+      _notify();
+      await _syncPreview(next, model, epoch);
     } catch (error) {
+      if (!_current(epoch)) return;
       cameraError = error.toString();
       _onError?.call('相机暂不可用，请重新打开');
       _notify();
     }
   }
+
+  static Future<void> _optional(Future<void> Function() operation) async {
+    try {
+      await operation();
+    } catch (_) {
+      // 可选相机功能或已被系统释放的旧资源，不影响正常拍照。
+    }
+  }
+
+  Future<void> _syncPreview(
+    CameraController camera,
+    PicoDetModel model,
+    int epoch,
+  ) => _previewOperations = _previewOperations.then((_) async {
+    if (!_current(epoch, camera) || !camera.value.isInitialized) return;
+    if (!_wantsActive) {
+      await _optional(() => camera.setFlashMode(FlashMode.off));
+      isTorchEnabled = false;
+      if (_current(epoch, camera)) await _optional(camera.pausePreview);
+      return;
+    }
+    try {
+      if (camera.value.isPreviewPaused) await camera.resumePreview();
+      if (!_current(epoch, camera) || !_wantsActive) return;
+      _active = true;
+    } catch (error) {
+      if (!_current(epoch, camera)) return;
+      cameraError = error.toString();
+      _active = false;
+      _onError?.call('相机暂不可用，请重新打开');
+      _notify();
+      return;
+    }
+    if (!_streamReady || camera.value.isStreamingImages) return;
+    try {
+      await camera.startImageStream((image) {
+        if (_current(epoch, camera)) _accept(image, model);
+      });
+    } catch (error) {
+      if (!_current(epoch, camera)) return;
+      modelError = error.toString();
+      _onError?.call('识别暂不可用，仍可拍照');
+      _notify();
+    }
+  });
 
   void _notify() {
     if (!_disposed) changes.value++;
@@ -158,19 +266,32 @@ class DeliveryCameraController {
   Future<Map<String, dynamic>?> getCameraZoomState() async => !isInitialized
       ? null
       : {
-          'available': true,
+          'available': _zoomAvailable,
           'minimum': _minimum,
           'maximum': _maximum,
           'current': _zoom,
         };
   Future<void> setZoomLevel(double value) async {
-    if (!isInitialized || !_active) return;
+    final camera = _camera;
+    if (!isInitialized || !_active || !_zoomAvailable || !value.isFinite)
+      return;
+    final epoch = _initializationEpoch;
     _generation++;
     _jpeg = null;
     objects = [];
     _text = {};
     final target = value.clamp(_minimum, _maximum);
-    await _camera!.setZoomLevel(target);
+    try {
+      await camera!.setZoomLevel(target);
+    } catch (_) {
+      if (_current(epoch, camera)) {
+        _zoomAvailable = false;
+        _onError?.call('当前相机暂不支持缩放，仍可拍照');
+        _notify();
+      }
+      return;
+    }
+    if (!_current(epoch, camera)) return;
     _zoom = target;
     if (!_disposed) _zoomEvents.add(target);
     _notify();
@@ -181,10 +302,16 @@ class DeliveryCameraController {
   }
 
   Future<void> toggleTorch() async {
-    if (!isInitialized) return;
+    if (!isInitialized || !_active) return;
+    final camera = _camera!;
+    final epoch = _initializationEpoch;
     final next = !isTorchEnabled;
-    await _camera!.setFlashMode(next ? FlashMode.torch : FlashMode.off);
-    isTorchEnabled = next;
+    try {
+      await camera.setFlashMode(next ? FlashMode.torch : FlashMode.off);
+      if (_current(epoch, camera) && _active) isTorchEnabled = next;
+    } catch (_) {
+      if (_current(epoch, camera)) _onError?.call('当前相机暂不支持补光灯');
+    }
   }
 
   Future<Map<String, dynamic>?> getCameraPerformanceState() =>
@@ -224,6 +351,8 @@ class DeliveryCameraController {
           'format': image.format.group.name,
           'rotation': rotation,
           'inputSize': model.inputSize,
+          if (model.iosInterpolation != null)
+            'iosInterpolation': model.iosInterpolation,
           'planes': image.planes
               .map(
                 (p) => {
@@ -244,6 +373,12 @@ class DeliveryCameraController {
       final inferenceClock = Stopwatch()..start();
       if (_detection && _detector != null && data != null) {
         detections = await _detector!.detect(frameTensor(data), _confidence);
+        if (!_disposed && _active && generation == _generation) {
+          if (modelError != null) {
+            modelError = null;
+            _notify();
+          }
+        }
       }
       final inferenceMs = inferenceClock.elapsedMicroseconds / 1000;
       if (_disposed || !_active || generation != _generation || _captureBusy)
@@ -298,8 +433,10 @@ class DeliveryCameraController {
       });
     } catch (error) {
       if (!_disposed && _active && generation == _generation) {
+        final changed = modelError != error.toString();
         modelError = error.toString();
-        _onError?.call('识别暂不可用，仍可拍照');
+        if (changed) _onError?.call('识别暂不可用，仍可拍照');
+        _notify();
       }
     }
   }
@@ -337,27 +474,23 @@ class DeliveryCameraController {
   }
 
   Future<void> pause() async {
+    _wantsActive = false;
     _active = false;
     _generation++;
     _jpeg = null;
     _text = {};
     objects = [];
-    if (isInitialized) {
-      try {
-        await _camera!.setFlashMode(FlashMode.off);
-        isTorchEnabled = false;
-        await _camera!.pausePreview();
-      } catch (_) {
-        /* Lifecycle interruption may release the native camera first. */
-      }
+    if (isInitialized && _model != null) {
+      await _syncPreview(_camera!, _model!, _initializationEpoch);
     }
   }
 
   Future<void> resume() async {
-    if (isInitialized) {
-      _active = true;
-      _generation++;
-      await _camera!.resumePreview();
+    if (_disposed) return;
+    _wantsActive = true;
+    _generation++;
+    if (isInitialized && _model != null) {
+      await _syncPreview(_camera!, _model!, _initializationEpoch);
     }
   }
 
@@ -365,17 +498,23 @@ class DeliveryCameraController {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _initializationEpoch++;
+    _wantsActive = false;
     _active = false;
     _generation++;
-    final camera = _camera;
-    _camera = null;
-    unawaited(camera?.dispose());
-    // 等当前推理释放张量后再关闭 session。
+    // 等初始化与当前推理释放资源后再关闭，避免加载/推理期间释放 session。
     unawaited(() async {
+      await _initialization;
+      await _previewOperations;
+      final camera = _camera;
+      _camera = null;
+      await _optional(() async => camera?.dispose());
       while (_busy) {
         await Future<void>.delayed(const Duration(milliseconds: 20));
       }
-      await _detector?.close();
+      final detector = _detector;
+      _detector = null;
+      await _optional(() async => detector?.close());
     }());
     unawaited(_zoomEvents.close());
     changes.dispose();

@@ -40,6 +40,7 @@ class DeliveryPhotoAssistPlugin : FlutterPlugin, MethodChannel.MethodCallHandler
             try {
                 val packet: Any? = when (call.method) {
                     "prepareCameraFrame" -> CameraFrame.prepare(args)
+                    "prepareProbeImage" -> CameraFrame.probe(args)
                     "prepareImportedPhoto" -> FrameQuality.normalizeImported(args["image"] as ByteArray)?.let { mapOf("jpeg" to it) }
                     "analyzeSceneText" -> SceneTextScanner.jpeg(args["image"] as ByteArray)
                     else -> null
@@ -54,27 +55,30 @@ class DeliveryPhotoAssistPlugin : FlutterPlugin, MethodChannel.MethodCallHandler
 }
 
 private object CameraFrame {
+    // 本机诊断入口：直接复用实时识别的张量生成器，不参与拍照保存或合规判断。
+    fun probe(args: Map<*, *>): Map<String, Any> {
+        val bytes = args["image"] as ByteArray
+        val image = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: error("image")
+        try {
+            val size = (args["inputSize"] as Number).toInt()
+            require(size in 32..1280)
+            val output = if ((args["interpolation"] ?: args["iosInterpolation"]) == "opencv_cubic_uint8") {
+                DeliveryTensor.make(image, size)
+            } else tensor(image, size)
+            return mapOf("tensor" to output, "width" to image.width, "height" to image.height)
+        } finally { image.recycle() }
+    }
+
     fun prepare(args: Map<*, *>): Map<String, Any> {
         val width = (args["width"] as Number).toInt(); val height = (args["height"] as Number).toInt()
         require(width in 1..8192 && height in 1..8192)
-        val planes = args["planes"] as List<*>
-        val yPlane = planes[0] as Map<*, *>; val y = yPlane["bytes"] as ByteArray
-        val nv21: ByteArray
-        if (planes.size == 1) { nv21 = y }
-        else {
-            nv21 = ByteArray(width * height * 3 / 2)
-            val yStride = (yPlane["rowStride"] as Number).toInt()
-            for (row in 0 until height) System.arraycopy(y, row * yStride, nv21, row * width, width)
-            val uPlane = planes[1] as Map<*, *>; val vPlane = planes[2] as Map<*, *>
-            val u = uPlane["bytes"] as ByteArray; val v = vPlane["bytes"] as ByteArray
-            val uRow = (uPlane["rowStride"] as Number).toInt(); val vRow = (vPlane["rowStride"] as Number).toInt()
-            val uPixel = (uPlane["pixelStride"] as Number).toInt(); val vPixel = (vPlane["pixelStride"] as Number).toInt()
-            var out = width * height
-            for (row in 0 until height / 2) for (col in 0 until width / 2) {
-                nv21[out++] = v[row * vRow + col * vPixel]
-                nv21[out++] = u[row * uRow + col * uPixel]
-            }
+        require(args["format"] == "yuv420" || args["format"] == "nv21") { "Unsupported camera format" }
+        val planes = (args["planes"] as List<*>).map {
+            val plane = it as Map<*, *>
+            YuvPacking.Plane(plane["bytes"] as ByteArray,
+                (plane["rowStride"] as Number).toInt(), (plane["pixelStride"] as Number).toInt())
         }
+        val nv21 = YuvPacking.nv21(width, height, planes)
         val encoded = ByteArrayOutputStream().use { out ->
             require(YuvImage(nv21, ImageFormat.NV21, width, height, null).compressToJpeg(Rect(0, 0, width, height), 90, out))
             out.toByteArray()
@@ -94,7 +98,11 @@ private object CameraFrame {
                     "height" to upright.height, "quality" to FrameQuality.bitmap(small, roi).toMutableMap().apply { put("scope", "live_preview; heuristic; not saved photo validation") })
                 if (args["prepareTensor"] == true) {
                     val size = (args["inputSize"] as Number).toInt(); require(size in 32..1280)
-                    result["tensor"] = tensor(upright, size)
+                    // 兼容先前自训 manifest 中的字段名，语义为双端输入插值方式。
+                    val interpolation = args["interpolation"] ?: args["iosInterpolation"]
+                    result["tensor"] = if (interpolation == "opencv_cubic_uint8") {
+                        DeliveryTensor.make(upright, size)
+                    } else tensor(upright, size)
                 }
                 return result
             } finally { if (small !== upright) small.recycle() }

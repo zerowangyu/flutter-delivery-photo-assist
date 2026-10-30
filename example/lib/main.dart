@@ -4,6 +4,17 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:delivery_photo_assist/delivery_photo_assist.dart';
 
+// 自定义权重仅从宿主本地资源打包，不进入通用组件仓库。
+const _customModelAsset = String.fromEnvironment('DELIVERY_MODEL_ASSET');
+const _customModelName = String.fromEnvironment(
+  'DELIVERY_MODEL_NAME',
+  defaultValue: '自定义配送模型',
+);
+const _confidenceText = String.fromEnvironment(
+  'DELIVERY_MODEL_CONFIDENCE',
+  defaultValue: '0.35',
+);
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -38,16 +49,19 @@ class _ExampleHomeState extends State<ExampleHome> {
   String? _error;
   Future<PicoDetModel> _model() async {
     final dir = await getApplicationSupportDirectory();
+    final base = _customModelAsset.isEmpty
+        ? 'picodet_${_variant}_320'
+        : _customModelAsset;
     for (final ext in ['onnx', 'json']) {
-      final name = 'picodet_${_variant}_320.$ext';
+      final name = '$base.$ext';
       final data = await rootBundle.load('assets/models/$name');
       await File('${dir.path}/$name').writeAsBytes(
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
       );
     }
     return PicoDetModel.fromFiles(
-      modelPath: '${dir.path}/picodet_${_variant}_320.onnx',
-      manifestPath: '${dir.path}/picodet_${_variant}_320.json',
+      modelPath: '${dir.path}/$base.onnx',
+      manifestPath: '${dir.path}/$base.json',
     );
   }
 
@@ -61,14 +75,23 @@ class _ExampleHomeState extends State<ExampleHome> {
     try {
       final model = await _model();
       if (!mounted) return;
+      final confidence = double.tryParse(_confidenceText) ?? .35;
+      final settings = GuideSettings(
+        confidence: confidence.isFinite ? confidence.clamp(0, 1) : .35,
+      );
       final result = retakeStage != null && previous != null
           ? await DeliveryPhotoAssist.retake(
               context,
               model: model,
               previous: previous,
               stage: retakeStage,
+              settings: settings,
             )
-          : await DeliveryPhotoAssist.capture(context, model: model);
+          : await DeliveryPhotoAssist.capture(
+              context,
+              model: model,
+              settings: settings,
+            );
       if (mounted && result != null) setState(() => _result = result);
     } catch (error) {
       if (mounted) setState(() => _error = '暂时无法打开：$error');
@@ -103,20 +126,27 @@ class _ExampleHomeState extends State<ExampleHome> {
             style: TextStyle(height: 1.8),
           ),
           const SizedBox(height: 28),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 's', label: Text('PicoDet-S')),
-              ButtonSegment(value: 'xs', label: Text('PicoDet-XS')),
-            ],
-            selected: {_variant},
-            onSelectionChanged: _opening
-                ? null
-                : (v) => setState(() => _variant = v.first),
-          ),
+          if (_customModelAsset.isEmpty)
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 's', label: Text('PicoDet-S')),
+                ButtonSegment(value: 'xs', label: Text('PicoDet-XS')),
+              ],
+              selected: {_variant},
+              onSelectionChanged: _opening
+                  ? null
+                  : (v) => setState(() => _variant = v.first),
+            ),
           const SizedBox(height: 16),
-          const Text(
-            '接入验证版 · 当前为 COCO 通用模型\n纸箱、配送软袋、整箱饮料等专项类别待训练模型接入。',
-            style: TextStyle(fontSize: 12, color: Colors.black54, height: 1.7),
+          Text(
+            _customModelAsset.isEmpty
+                ? '接入验证版 · 当前为 COCO 通用模型\n纸箱、配送软袋、整箱饮料等专项类别待训练模型接入。'
+                : '已启用 $_customModelName\n识别结果仅作提醒，请以实际拍摄效果为准。',
+            style: const TextStyle(
+              fontSize: 12,
+              color: Colors.black54,
+              height: 1.7,
+            ),
           ),
           const SizedBox(height: 24),
           FilledButton.icon(

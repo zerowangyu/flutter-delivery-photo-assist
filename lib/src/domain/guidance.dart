@@ -52,6 +52,7 @@ class GuideSettings {
 }
 
 const boxLabels = {
+  'delivery_item',
   'Box',
   'cardboard box',
   'parcel_box',

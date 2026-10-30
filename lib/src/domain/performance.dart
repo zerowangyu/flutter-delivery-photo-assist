@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 
-enum AnalysisTier { standard, reduced, minimal }
+enum AnalysisTier { standard, reduced, lowFrequency, minimal }
 
 class AnalysisBudget {
   const AnalysisBudget(
@@ -17,6 +17,7 @@ class AnalysisBudget {
   String get label => switch (tier) {
     AnalysisTier.standard => '自动适配',
     AnalysisTier.reduced => '流畅优先',
+    AnalysisTier.lowFrequency => '低频识别',
     AnalysisTier.minimal => '轻量提示',
   };
   Map<String, Object> toJson() => {
@@ -57,6 +58,7 @@ class PerformanceGovernor {
         _framingTooSlow ? 0 : 1200,
         false,
       ),
+      AnalysisTier.lowFrequency => AnalysisBudget(tier, 1, 0, false),
       AnalysisTier.minimal => AnalysisBudget(tier, 1, 0, false),
     };
   }
@@ -92,7 +94,7 @@ class PerformanceGovernor {
     _slowModel = ms > 180 ? _slowModel + 1 : 0;
     _verySlowModel = ms > 450 ? _verySlowModel + 1 : 0;
     if (_verySlowModel >= 4) {
-      _degrade(AnalysisTier.minimal, 'model_over_budget', nowMs);
+      _degrade(AnalysisTier.lowFrequency, 'model_over_budget', nowMs);
     } else if (_slowModel >= 6) {
       _degrade(AnalysisTier.reduced, 'model_slow', nowMs);
     }

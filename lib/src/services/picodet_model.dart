@@ -15,10 +15,12 @@ class PicoDetModel {
     this.inputSize = 320,
     this.boxesOutput = 'multiclass_nms3_0.tmp_0',
     this.countOutput = 'multiclass_nms3_0.tmp_2',
+    this.iosInterpolation,
   });
   final String path, name, boxesOutput, countOutput;
   final List<String> labels;
   final int inputSize;
+  final String? iosInterpolation;
   static Future<PicoDetModel> fromFiles({
     required String modelPath,
     required String manifestPath,
@@ -43,6 +45,7 @@ class PicoDetModel {
       inputSize: (data['inputSize'] as num).toInt(),
       boxesOutput: data['boxesOutput'] as String,
       countOutput: data['countOutput'] as String,
+      iosInterpolation: data['iosInterpolation'] as String?,
     );
   }
 }
@@ -56,6 +59,14 @@ class PicoDetDetector {
         model.inputSize > 1280 ||
         model.labels.isEmpty) {
       throw ArgumentError('模型尺寸或类别清单无效');
+    }
+    if (model.iosInterpolation != null &&
+        model.iosInterpolation != 'opencv_cubic_uint8') {
+      throw ArgumentError('不支持该模型预处理插值协议');
+    }
+    if (model.iosInterpolation == 'opencv_cubic_uint8' &&
+        model.inputSize != 320) {
+      throw ArgumentError('双端 opencv_cubic_uint8 协议目前仅支持 320 输入');
     }
     _session = await OnnxRuntime().createSession(
       model.path,

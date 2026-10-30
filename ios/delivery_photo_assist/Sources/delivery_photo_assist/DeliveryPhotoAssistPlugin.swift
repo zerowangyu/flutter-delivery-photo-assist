@@ -92,7 +92,16 @@ private enum CameraFrame {
     if args["prepareTensor"] as? Bool == true {
       let inputSize = args["inputSize"] as? Int ?? 320
       guard inputSize >= 32, inputSize <= 1280 else { throw FrameError.invalid }
-      result["tensor"] = FlutterStandardTypedData(bytes: try tensor(image, size: inputSize))
+      if args["iosInterpolation"] as? String == "opencv_cubic_uint8" {
+        guard inputSize == 320, [0, 90, 180, 270].contains(rotation) else { throw FrameError.invalid }
+        let values = data.withUnsafeBytes { memory in
+          DeliveryTensor.make(memory.baseAddress!.assumingMemoryBound(to: UInt8.self),
+            width: width, height: height, stride: stride, rgb: [2, 1, 0], rotation: rotation)
+        }
+        result["tensor"] = FlutterStandardTypedData(bytes: values.withUnsafeBytes { Data($0) })
+      } else {
+        result["tensor"] = FlutterStandardTypedData(bytes: try tensor(image, size: inputSize))
+      }
     }
     return result
   }

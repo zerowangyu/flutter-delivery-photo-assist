@@ -10,6 +10,7 @@ import 'package:delivery_photo_assist/src/services/frame_tensor.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  const custom = String.fromEnvironment('DELIVERY_MODEL_ASSET');
   const native = MethodChannel('delivery_photo_assist');
   Future<Map<dynamic, dynamic>> frame() async {
     const width = 320, height = 480;
@@ -63,6 +64,7 @@ void main() {
       ...args,
       'rotation': 0,
       'inputSize': 320,
+      if (custom.isNotEmpty) 'iosInterpolation': 'opencv_cubic_uint8',
       'prepareTensor': true,
     }))!;
   }
@@ -85,21 +87,34 @@ void main() {
         expect(tensor[0], closeTo((1 - .485) / .229, .02));
         expect(tensor[320 * 320], closeTo(-.456 / .224, .02));
         expect(tensor[2 * 320 * 320], closeTo(-.406 / .225, .02));
+      } else {
+        // YUV/JPEG 的范围换算因平台实现可落在 128～130；各通道仍应为中性灰。
+        final gray = (tensor[0] * .229 + .485) * 255;
+        expect(gray, inInclusiveRange(126, 132));
+        for (final (channel, mean, std) in [
+          (0, .485, .229),
+          (1, .456, .224),
+          (2, .406, .225),
+        ]) {
+          expect(
+            tensor[channel * 320 * 320],
+            closeTo((gray / 255 - mean) / std, .002),
+          );
+        }
       }
       final dir = await getApplicationSupportDirectory();
       final results = <String, Object>{};
-      for (final variant in ['s', 'xs']) {
+      for (final base
+          in custom.isEmpty ? ['picodet_s_320', 'picodet_xs_320'] : [custom]) {
         for (final ext in ['onnx', 'json']) {
-          final data = await rootBundle.load(
-            'assets/models/picodet_${variant}_320.$ext',
-          );
-          await File('${dir.path}/picodet_${variant}_320.$ext').writeAsBytes(
+          final data = await rootBundle.load('assets/models/$base.$ext');
+          await File('${dir.path}/$base.$ext').writeAsBytes(
             data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
           );
         }
         final model = await PicoDetModel.fromFiles(
-          modelPath: '${dir.path}/picodet_${variant}_320.onnx',
-          manifestPath: '${dir.path}/picodet_${variant}_320.json',
+          modelPath: '${dir.path}/$base.onnx',
+          manifestPath: '${dir.path}/$base.json',
         );
         final detector = PicoDetDetector(model);
         await detector.open();
@@ -115,7 +130,7 @@ void main() {
           await detector.close();
         }
         samples.sort();
-        results[variant] = {
+        results[base] = {
           'inferenceRoundTripMs': samples,
           'scope':
               'synthetic input; simulator/device as run; excludes camera and preprocessing',

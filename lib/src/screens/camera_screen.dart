@@ -164,7 +164,11 @@ class _CameraScreenState extends State<CameraScreen>
     _lastZoomRefreshMs = _clock.elapsedMilliseconds;
     try {
       final state = await _controller.getCameraZoomState();
-      if (!mounted || !_active || state?['available'] != true) return;
+      if (!mounted || !_active) return;
+      if (state?['available'] != true) {
+        if (_zoomAvailable) _update(() => _zoomAvailable = false);
+        return;
+      }
       final low = (state!['minimum'] as num?)?.toDouble();
       final high = (state['maximum'] as num?)?.toDouble();
       final current = (state['current'] as num?)?.toDouble();
@@ -301,7 +305,7 @@ class _CameraScreenState extends State<CameraScreen>
     _facts = facts;
     _hint = hint;
     _sawFrame = true;
-    _error = null;
+    if (_controller.cameraError == null) _error = null;
     _publishUi();
   }
 
@@ -337,6 +341,14 @@ class _CameraScreenState extends State<CameraScreen>
         _error!,
         '请重新打开相机',
         'camera_error',
+      );
+    }
+    if (_controller.modelError != null) {
+      return const CaptureAdvice(
+        CaptureState.observing,
+        '识别暂不可用，仍可拍照',
+        '请自行确认包裹与位置清晰，可在设置中重新打开相机',
+        'recognition_error',
       );
     }
     if (_clock.elapsedMilliseconds - _lastZoomChangeMs < 250) {
@@ -739,6 +751,7 @@ class _CameraScreenState extends State<CameraScreen>
 
   @override
   void didHaveMemoryPressure() {
+    if (!_active || _leaving) return;
     _governor.memoryPressure(_clock.elapsedMilliseconds);
     _facts = null;
     unawaited(_syncAnalysisPolicy());
@@ -976,6 +989,18 @@ class _CameraScreenState extends State<CameraScreen>
                 ),
                 const SizedBox(height: 18),
                 Text(
+                  '包裹识别：${_controller.modelError != null
+                      ? '暂不可用'
+                      : !_governor.budget.detectionEnabled
+                      ? '保护暂停'
+                      : !_controller.modelReady || !_sawFrame
+                      ? '正在准备'
+                      : _governor.budget.tier == AnalysisTier.lowFrequency
+                      ? '低频运行，每秒最多一次'
+                      : '运行中'}',
+                  style: const TextStyle(fontSize: 13, height: 1.7),
+                ),
+                Text(
                   '识别参考：${labels.isEmpty ? '暂未确认' : labels}',
                   style: const TextStyle(fontSize: 13, height: 1.7),
                 ),
@@ -995,23 +1020,24 @@ class _CameraScreenState extends State<CameraScreen>
                     color: Colors.black54,
                   ),
                 ),
-                if (_error != null ||
-                    (!_sawFrame && _clock.elapsedMilliseconds > 10000))
-                  TextButton(
-                    onPressed: () {
-                      Navigator.pop(sheet);
-                      _policyKey = '';
-                      _zoomAvailable = false;
-                      _analysisGeneration++;
-                      _framingTracker.reset(_framingTracker.referenceId);
-                      super.setState(() {
-                        _cameraGeneration++;
-                        _nativeView = _createNativeView();
-                        _error = null;
-                      });
-                    },
-                    child: const Text('重新打开相机'),
-                  ),
+                TextButton(
+                  onPressed: () {
+                    Navigator.pop(sheet);
+                    _policyKey = '';
+                    _zoomAvailable = false;
+                    _analysisGeneration++;
+                    _facts = null;
+                    _sawFrame = false;
+                    _stabilizer.reset();
+                    _framingTracker.reset(_framingTracker.referenceId);
+                    super.setState(() {
+                      _cameraGeneration++;
+                      _nativeView = _createNativeView();
+                      _error = null;
+                    });
+                  },
+                  child: const Text('重新打开相机'),
+                ),
               ],
             );
           },
